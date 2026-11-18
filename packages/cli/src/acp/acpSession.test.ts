@@ -707,6 +707,69 @@ describe('Session', () => {
 
       expect(result).toEqual({ outcome: 'failed' });
     });
+
+    it('should preserve leftover steering hints and append them to the next prompt when previous turn had no tools', async () => {
+      let turn1Resolve: () => void = () => {};
+      const turn1Promise = new Promise<void>((resolve) => {
+        turn1Resolve = resolve;
+      });
+
+      async function* stream1(): AsyncGenerator<ServerGeminiStreamEvent> {
+        turn1Resolve();
+        yield {
+          type: GeminiEventType.Content,
+          value: 'Done without tools',
+        };
+        yield {
+          type: GeminiEventType.Finished,
+          value: {
+            reason: FinishReason.STOP,
+            usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5 },
+          },
+        };
+      }
+
+      const stream2 = createMockStream([
+        {
+          type: GeminiEventType.Content,
+          value: 'Task 2 response',
+        },
+      ]);
+
+      mockSendMessageStream
+        .mockReturnValueOnce(stream1())
+        .mockReturnValueOnce(stream2);
+
+      const promptPromise1 = session.prompt({
+        sessionId: 'session-1',
+        prompt: [{ type: 'text', text: 'Task 1' }],
+      });
+
+      // Wait until turn 1 is actively running
+      await turn1Promise;
+
+      // Steer while prompt 1 is running
+      const steerResult = await session.steer({
+        sessionId: 'session-1',
+        prompt: [{ type: 'text', text: 'Leftover guidance' }],
+      });
+      expect(steerResult).toEqual({ outcome: 'injected' });
+
+      const promptResult1 = await promptPromise1;
+      expect(promptResult1.stopReason).toBe('end_turn');
+
+      // Subsequent prompt 2 should have the leftover hint appended to params.prompt
+      await session.prompt({
+        sessionId: 'session-1',
+        prompt: [{ type: 'text', text: 'Task 2' }],
+      });
+
+      expect(mockSendMessageStream).toHaveBeenCalledTimes(2);
+      const secondPromptParts = mockSendMessageStream.mock.calls[1][0] as Array<{ text?: string }>;
+      const combinedText = secondPromptParts.map((p) => p.text ?? '').join('\n');
+      expect(combinedText).toContain('Task 2');
+      expect(combinedText).toContain('Leftover guidance');
+    });
   });
 
   it('should handle tool call permission request', async () => {

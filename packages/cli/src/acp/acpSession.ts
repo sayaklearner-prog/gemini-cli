@@ -58,6 +58,7 @@ import {
   RequestPermissionResponseSchema,
   type SteeringRequest,
   type SteeringResponse,
+  SessionState,
 } from './acpUtils.js';
 import { z } from 'zod';
 import { getAcpErrorMessage } from './acpErrors.js';
@@ -68,6 +69,7 @@ const StructuredErrorSchema = z.object({
 });
 
 export class Session {
+  private sessionState: SessionState = SessionState.Idle;
   private pendingPrompt: AbortController | null = null;
   private pendingSteeringHints: string[] = [];
   private commandHandler = new CommandHandler();
@@ -226,10 +228,11 @@ export class Session {
   }
 
   async cancelPendingPrompt(): Promise<void> {
-    if (!this.pendingPrompt) {
+    if (this.sessionState !== SessionState.Generating || !this.pendingPrompt) {
       throw new Error('Not currently generating');
     }
 
+    this.sessionState = SessionState.Idle;
     this.pendingPrompt.abort();
     this.pendingPrompt = null;
   }
@@ -246,7 +249,7 @@ export class Session {
       return { outcome: 'failed' };
     }
 
-    if (this.pendingPrompt !== null) {
+    if (this.sessionState === SessionState.Generating) {
       this.pendingSteeringHints.push(...textHints);
       return { outcome: 'injected' };
     }
@@ -370,10 +373,30 @@ export class Session {
   }
 
   async prompt(params: acp.PromptRequest): Promise<acp.PromptResponse> {
+    const wasAborted = this.sessionState === SessionState.Generating;
     this.pendingPrompt?.abort();
     const pendingSend = new AbortController();
     this.pendingPrompt = pendingSend;
-    this.pendingSteeringHints = [];
+    this.sessionState = SessionState.Generating;
+
+    if (!wasAborted) {
+      if (this.pendingSteeringHints.length > 0) {
+        const formattedHints = formatUserHintsForModel(
+          this.pendingSteeringHints,
+        );
+        this.pendingSteeringHints = [];
+        if (formattedHints) {
+          params.prompt = [
+            ...params.prompt,
+            { type: 'text', text: formattedHints },
+          ];
+        }
+      } else {
+        this.pendingSteeringHints = [];
+      }
+    } else {
+      this.pendingSteeringHints = [];
+    }
 
     await this.context.config.waitForMcpInit();
 
@@ -409,6 +432,7 @@ export class Session {
       // It uses `parts` argument but effectively ignores it in current implementation
       const handled = await this.handleCommand(commandText, parts);
       if (handled) {
+        this.sessionState = SessionState.Idle;
         this.pendingPrompt = null;
         return {
           stopReason: 'end_turn',
@@ -436,6 +460,7 @@ export class Session {
     const buildPromptResponse = (
       stopReason: acp.StopReason,
     ): acp.PromptResponse => {
+      this.sessionState = SessionState.Idle;
       this.pendingPrompt = null;
       return {
         stopReason,
@@ -478,6 +503,7 @@ export class Session {
       }
 
       if (pendingSend.signal.aborted) {
+        this.sessionState = SessionState.Idle;
         this.pendingPrompt = null;
         return { stopReason: 'cancelled' };
       }
@@ -499,6 +525,7 @@ export class Session {
 
         for await (const event of responseStream) {
           if (pendingSend.signal.aborted) {
+            this.sessionState = SessionState.Idle;
             this.pendingPrompt = null;
             return { stopReason: 'cancelled' };
           }
@@ -619,11 +646,13 @@ export class Session {
           pendingSend.signal.aborted ||
           (error instanceof Error && error.name === 'AbortError')
         ) {
+          this.sessionState = SessionState.Idle;
           this.pendingPrompt = null;
           return { stopReason: 'cancelled' };
         }
 
         if (error instanceof acp.RequestError) {
+          this.sessionState = SessionState.Idle;
           this.pendingPrompt = null;
           throw error;
         }
@@ -648,6 +677,7 @@ export class Session {
           return buildPromptResponse('end_turn');
         }
 
+        this.sessionState = SessionState.Idle;
         this.pendingPrompt = null;
         throw new acp.RequestError(
           getErrorStatus(error) || 500,

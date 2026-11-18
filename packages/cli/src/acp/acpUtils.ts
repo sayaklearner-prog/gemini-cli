@@ -429,3 +429,8 @@ export type SteeringOutcome =
 export interface SteeringResponse {
   outcome: SteeringOutcome;
 }
+
+export enum SessionState {
+  Idle = 'idle',
+  Generating = 'generating',
+}
